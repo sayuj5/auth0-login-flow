@@ -1,97 +1,132 @@
-import os
-from functools import wraps
-from urllib.parse import urlencode, quote_plus
+# This quickstart uses Flask, but the Auth0 Python SDK works with any
+# framework. For FastAPI, see: https://github.com/auth0/auth0-fastapi
+import json
+from os import environ as env
+from urllib.parse import urlparse
 
-from authlib.integrations.flask_client import OAuth
+from auth0_server_python.auth_server.server_client import ServerClient
+from auth0_server_python.auth_types import LogoutOptions, StartInteractiveLoginOptions, StateData, TransactionData
+from auth0_server_python.store.abstract import AbstractDataStore
 from dotenv import load_dotenv
-from flask import Flask, redirect, render_template_string, session, url_for
+from flask import Flask, after_this_request, redirect, request
+from markupsafe import escape
 
 load_dotenv()
 
 app = Flask(__name__)
-app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-secret-change-me")
-
-oauth = OAuth(app)
-oauth.register(
-    "auth0",
-    client_id=os.getenv("AUTH0_CLIENT_ID"),
-    client_secret=os.getenv("AUTH0_CLIENT_SECRET"),
-    client_kwargs={"scope": "openid profile email"},
-    server_metadata_url=f'https://{os.getenv("AUTH0_DOMAIN")}/.well-known/openid-configuration',
-)
 
 
-def login_required(view_func):
-    @wraps(view_func)
-    def wrapped(*args, **kwargs):
-        if "user" not in session:
-            return redirect(url_for("home"))
-        return view_func(*args, **kwargs)
+# The SDK requires two stores: one for session data (user profile, tokens)
+# and one for short-lived OAuth flow data (PKCE verifiers, state params).
+# Both extend AbstractDataStore which provides encrypt() and decrypt().
+# This implementation stores data in encrypted cookies, but you could
+# also use Redis, PostgreSQL, or any other backend by implementing
+# the same set/get/delete interface.
+class CookieStore(AbstractDataStore):
+    def __init__(self, secret, cookie_name, max_age, model):
+        super().__init__({"secret": secret})
+        self.cookie_name = cookie_name
+        self.max_age = max_age
+        self.model = model
 
-    return wrapped
+    async def set(self, identifier, state, **_):
+        @after_this_request
+        def apply(response):
+            data = state.model_dump() if hasattr(state, "model_dump") else state
+            response.set_cookie(
+                self.cookie_name,
+                self.encrypt(identifier, data),
+                httponly=True,
+                samesite="Lax",
+                secure=not env.get("APP_BASE_URL", "").startswith("http://"),
+                max_age=self.max_age,
+            )
+            return response
+
+    async def get(self, identifier, options=None):
+        try:
+            encrypted = options["request"].cookies.get(self.cookie_name)
+            return self.model.model_validate(self.decrypt(identifier, encrypted)) if encrypted else None
+        except Exception:
+            app.logger.warning("Failed to decrypt cookie %s", self.cookie_name, exc_info=True)
+            return None
+
+    async def delete(self, *_, **__):
+        @after_this_request
+        def apply(response):
+            response.delete_cookie(self.cookie_name)
+            return response
+
+
+def auth0():
+    session_secret = env.get("AUTH0_SECRET")
+
+    return ServerClient(
+        domain=env.get("AUTH0_DOMAIN"),
+        client_id=env.get("AUTH0_CLIENT_ID"),
+        client_secret=env.get("AUTH0_CLIENT_SECRET"),
+        redirect_uri=env.get("APP_BASE_URL") + "/callback",
+        authorization_params={"scope": "openid profile email"},
+        secret=session_secret,
+        state_store=CookieStore(session_secret, "_a0_session", 259200, StateData),  # 3 days
+        transaction_store=CookieStore(session_secret, "_a0_tx", 300, TransactionData),  # 5 min
+    )
 
 
 @app.route("/")
-def home():
-    user = session.get("user")
-    return render_template_string(
+async def home():
+    user = await auth0().get_user({"request": request})
+
+    head = "<!DOCTYPE html><title>Auth0 Python Sample</title>"
+
+    if user:
+        return f"""
+            {head}
+            <p>Logged in as {escape(user.get("email", ""))}</p>
+            <h1>User Profile</h1>
+            <pre>{escape(json.dumps(user, indent=2))}</pre>
+            <a href="/logout">Logout</a>
         """
-        <h1>Auth0 Login Flow</h1>
-        {% if user %}
-          <p>Signed in as {{ user.get('name') or user.get('email') or user.get('sub') }}</p>
-          <a href="{{ url_for('profile') }}">View Profile</a><br>
-          <a href="{{ url_for('logout') }}">Logout</a>
-        {% else %}
-          <a href="{{ url_for('login') }}">Login with Auth0</a>
-        {% endif %}
-        """,
-        user=user,
-    )
+
+    return f"""
+        {head}
+        <a href="/login?screen_hint=signup">Signup</a>
+        <a href="/login">Login</a>
+    """
 
 
 @app.route("/login")
-def login():
-    return oauth.auth0.authorize_redirect(
-        redirect_uri=url_for("callback", _external=True)
+async def login():
+    url = await auth0().start_interactive_login(
+        options=StartInteractiveLoginOptions(
+            authorization_params=dict(request.args),
+        ),
+        store_options={"request": request},
     )
+    return redirect(url)
 
 
 @app.route("/callback")
-def callback():
-    token = oauth.auth0.authorize_access_token()
-    session["user"] = token.get("userinfo") or oauth.auth0.userinfo()
-    return redirect(url_for("profile"))
-
-
-@app.route("/profile")
-@login_required
-def profile():
-    return render_template_string(
-        """
-        <h1>Profile</h1>
-        <pre>{{ user | tojson(indent=2) }}</pre>
-        <a href="{{ url_for('logout') }}">Logout</a>
-        """,
-        user=session["user"],
-    )
+async def callback():
+    try:
+        await auth0().complete_interactive_login(
+            url=request.url, store_options={"request": request},
+        )
+        return redirect("/")
+    except Exception:
+        app.logger.exception("Callback error")
+        return "Something went wrong. Check server logs for details.", 400
 
 
 @app.route("/logout")
-def logout():
-    session.clear()
-    return redirect(
-        "https://"
-        + os.getenv("AUTH0_DOMAIN", "")
-        + "/v2/logout?"
-        + urlencode(
-            {
-                "returnTo": url_for("home", _external=True),
-                "client_id": os.getenv("AUTH0_CLIENT_ID", ""),
-            },
-            quote_via=quote_plus,
-        )
+async def logout():
+    url = await auth0().logout(
+        options=LogoutOptions(return_to=env.get("APP_BASE_URL")),
+        store_options={"request": request},
     )
+    return redirect(url)
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
+    url = urlparse(env.get("APP_BASE_URL"))
+    app.run(host=url.hostname, port=url.port or 5000)
